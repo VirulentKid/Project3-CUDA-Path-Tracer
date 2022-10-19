@@ -424,6 +424,18 @@ __global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iteration
 	}
 }
 
+__global__ void generateGBuffer(
+	int num_paths,
+	ShadeableIntersection* shadeableIntersections,
+	PathSegment* pathSegments,
+	GBufferPixel* gBuffer) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx < num_paths)
+	{
+		gBuffer[idx].t = shadeableIntersections[idx].t;
+	}
+}
+
 struct sort_material {
 	__host__ __device__ bool operator()(const ShadeableIntersection& m1, const ShadeableIntersection& m2) {
 		return m1.materialId < m2.materialId;
@@ -513,6 +525,9 @@ void pathtrace(int frame, int iter) {
 
 	// --- PathSegment Tracing Stage ---
 	// Shoot ray into scene, bounce between objects, push shading chunks
+	
+	// Empty gbuffer
+	cudaMemset(dev_gBuffer, 0, pixelcount * sizeof(GBufferPixel));
 
 	bool iterationComplete = false;
 	while (!iterationComplete) {
@@ -540,6 +555,11 @@ void pathtrace(int frame, int iter) {
 #if SORT_BY_MAT
 		thrust::sort_by_key(thrust::device, dev_intersections, dev_intersections + num_paths, dev_paths, sort_material());
 #endif //SORT BY MAT
+
+		if (depth == 0)
+		{
+			generateGBuffer << <numblocksPathSegmentTracing, blockSize1d >> > (num_paths, dev_intersections, dev_paths, dev_gBuffer);
+		}
 		depth++;
 
 
