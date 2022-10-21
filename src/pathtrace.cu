@@ -23,9 +23,18 @@
 #define ANTIALIASING 0
 #define CACHE_FIRST_BOUNCE 0
 #define SORT_BY_MAT 0
+#define NOR 1
+#define POS 2
+#define G_BUFFER_IMG_MODE POS
+#define PERFORMANCE_TIME 1
+
+#if PERFORMANCE_TIME
+cudaEvent_t start, stop;
+#endif
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
+
 void checkCUDAErrorFn(const char* msg, const char* file, int line) {
 #if ERRORCHECK
 	cudaDeviceSynchronize();
@@ -74,18 +83,79 @@ __global__ void sendImageToPBO(uchar4* pbo, glm::ivec2 resolution,
 		pbo[index].z = color.z;
 	}
 }
+
+//the following 3 helper functions are for oct-eocoding normal
+//reference: https://jcgt.org/published/0003/02/01/paper.pdf
+__host__ __device__ glm::vec2 signNotZero(glm::vec2 v) {
+	return glm::vec2((v.x >= 0) ? 1.f : -1.f, (v.y >= 0) ? 1.f : -1.f);
+}
+
+__host__ __device__ glm::vec2 float32x3_to_oct(glm::vec3 v) {
+	glm::vec2 p = glm::vec2(v) * (1.f / (abs(v.x) + abs(v.y) + abs(v.z)));
+	return (v.z <= 0) ? ((1.f - abs(p)) * signNotZero(p)) : p;
+}
+
+__host__ __device__ glm::vec3 oct_to_float32x3(glm::vec2 e) {
+	float z = 1.f - abs(e.x) - abs(e.y);
+	if (z < 0) {
+		e = (1.f - abs(e)) * signNotZero(e);
+	}
+	return normalize(glm::vec3(e, z));
+}
+
+__host__ __device__ glm::vec3 depthToPos(float depth, float x, float y, const Camera& cam) {
+	glm::vec3 dir = glm::normalize(cam.view
+		- cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f)
+		- cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f));
+	return cam.position + depth * dir;
+}
+
 __global__ void gbufferToPBO(uchar4* pbo, glm::ivec2 resolution, GBufferPixel* gBuffer) {
 	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
 	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
 
 	if (x < resolution.x && y < resolution.y) {
-		int index = x + (y * resolution.x);
-		float timeToIntersect = gBuffer[index].t * 256.0;
+		int idx = x + (y * resolution.x);
 
-		pbo[index].w = 0;
-		pbo[index].x = timeToIntersect;
-		pbo[index].y = timeToIntersect;
-		pbo[index].z = timeToIntersect;
+#if Z_DEPTH
+		glm::vec3 pos = glm::vec3(gBuffer[idx].z);
+#else 
+		glm::vec3 pos = gBuffer[idx].pos;
+#endif //Z_DEPTH
+
+#if OCT_ENCODING_NOR
+		glm::vec3 normal = oct_to_float32x3(gBuffer[idx].octNormal);
+#else
+		glm::vec3 normal = gBuffer[idx].normal;
+#endif //OCT_ENCODING_NOR
+
+#if G_BUFFER_IMG_MODE == NOR
+		normal = glm::abs(normal * 255.f);
+		pbo[idx].w = 0;
+		pbo[idx].x = normal.x;
+		pbo[idx].y = normal.y;
+		pbo[idx].z = normal.z;
+
+#elif G_BUFFER_IMG_MODE == POS
+
+#if !Z_DEPTH
+		pos = glm::clamp(glm::abs(pos * 25.f), 0.f, 255.f);
+#else
+		pos = glm::clamp(glm::abs(pos * 5.f), 0.f, 255.f);
+#endif
+		pbo[idx].w = 0;
+		pbo[idx].x = pos.x;
+		pbo[idx].y = pos.y;
+		pbo[idx].z = pos.z;
+
+#else
+		float timeToIntersect = gBuffer[idx].t * 256.0;
+
+		pbo[idx].w = 0;
+		pbo[idx].x = timeToIntersect;
+		pbo[idx].y = timeToIntersect;
+		pbo[idx].z = timeToIntersect;
+#endif //G_BUFFER_IMG
 	}
 }
 
@@ -98,7 +168,7 @@ static PathSegment* dev_paths = NULL;
 static PathSegment* dev_cache_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 static GBufferPixel* dev_gBuffer = NULL;
-
+static glm::vec3* dev_blurredImg = nullptr;
 // TODO: static variables for device memory, any extra info you need, etc
 // ...
 static Triangle* dev_triangles = NULL;
@@ -127,6 +197,7 @@ void pathtraceInit(Scene* scene) {
 	cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
 	cudaMalloc(&dev_gBuffer, pixelcount * sizeof(GBufferPixel));
+	cudaMalloc(&dev_blurredImg, pixelcount * sizeof(glm::vec3));
 
 	// TODO: initialize any extra device memeory you need
 	cudaMalloc(&dev_cache_paths, pixelcount * sizeof(PathSegment));
@@ -149,6 +220,8 @@ void pathtraceFree() {
 	cudaFree(dev_materials);
 	cudaFree(dev_intersections);
 	cudaFree(dev_gBuffer);
+	cudaFree(dev_blurredImg);
+
 	// TODO: clean up any extra device memory you created
 	cudaFree(dev_cache_paths);
 	cudaFree(dev_triangles);
@@ -432,7 +505,17 @@ __global__ void generateGBuffer(
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx < num_paths)
 	{
-		gBuffer[idx].t = shadeableIntersections[idx].t;
+#if Z_DEPTH
+		gBuffer[idx].z = shadeableIntersections[idx].t;
+#else
+		gBuffer[idx].pos = pathSegments[idx].ray.origin + shadeableIntersections[idx].t * pathSegments[idx].ray.direction;
+#endif //Z_DEPTH
+
+#if OCT_ENCODING_NOR
+		gBuffer[idx].octNormal = float32x3_to_oct(shadeableIntersections[idx].surfaceNormal);
+#else
+		gBuffer[idx].normal = shadeableIntersections[idx].surfaceNormal;
+#endif //OCT_ENCODING_NOR
 	}
 }
 
@@ -628,4 +711,104 @@ void showImage(uchar4* pbo, int iter) {
 
 	// Send results to OpenGL buffer for rendering
 	sendImageToPBO << <blocksPerGrid2d, blockSize2d >> > (pbo, cam.resolution, iter, dev_image);
+}
+
+__device__ glm::vec3 depth2Pos(Camera cam, float t, float x, float y) {
+	glm::vec3 dir = glm::normalize(cam.view - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f) - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f));
+	return cam.position + dir * t;
+}
+
+//reference: https://jo.dreggn.org/home/2010_atrous.pdf
+__global__ void aTrousFilter
+(
+	Camera cam,
+	glm::ivec2 resolution,
+	int stepWidth, 
+	float c_phi,
+	float n_phi, 
+	float p_phi,
+	const glm::vec3* img,
+	const GBufferPixel* gBuffer,
+	glm::vec3* blurredImg) {
+
+	int x = blockDim.x * blockIdx.x + threadIdx.x;
+	int y = blockDim.y * blockIdx.y + threadIdx.y;
+
+	if (x < resolution.x && y < resolution.y) {
+
+		int idx = y * resolution.x + x;
+		constexpr float kernel[5] = {0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f};
+
+		glm::vec3 sum(0.f);
+		float cum_w = 0.f;
+
+		for (int i = 0; i < 5; ++i)
+		{
+			for (int j = 0; j < 5; ++j)
+			{
+				int tx = glm::clamp(x + (i - 2) * stepWidth, 0, resolution.x);
+				int ty = glm::clamp(y + (j - 2) * stepWidth, 0, resolution.y);
+				int t_idx = ty * resolution.x + tx;
+
+				glm::vec3 ctmp = img[t_idx];
+				glm::vec3 t = img[idx] - ctmp;
+				float dist2 = glm::dot(t, t);
+				float c_w = min(exp(-dist2 / c_phi), 1.f);
+#if OCT_ENCODING_NOR
+				t = oct_to_float32x3(gBuffer[idx].octNormal) - oct_to_float32x3(gBuffer[t_idx].octNormal);
+#else
+				t = gBuffer[idx].normal - gBuffer[t_idx].normal;
+#endif //OCT_ENCODING_NOR
+
+				dist2 = max(glm::dot(t, t) / (stepWidth * stepWidth), 0.f);
+				float n_w = min(exp(-dist2 / n_phi), 1.f);
+
+#if Z_DEPTH
+				t = depth2Pos(cam, gBuffer[idx].z, x, y) - depth2Pos(cam, gBuffer[t_idx].z, x, y);
+#else
+				t = gBuffer[idx].pos - gBuffer[t_idx].pos;
+#endif //Z_DEPTH
+				dist2 = glm::dot(t, t);
+				float p_w = min(exp(-dist2 / p_phi), 1.f);
+
+				float weight = c_w * n_w * p_w;
+				sum += ctmp * weight * kernel[i] * kernel[j];
+				cum_w += weight * kernel[i] * kernel[j];
+			}
+		}
+		blurredImg[idx] = sum / cum_w;
+	}
+}
+
+void denoise()
+{
+	const glm::ivec2 resolution = hst_scene->state.camera.resolution;
+	const Camera& cam = hst_scene->state.camera;
+	const dim3 blockSize2d(8, 8);
+	const dim3 blocksPerGrid2d((resolution.x + blockSize2d.x - 1) / blockSize2d.x, (resolution.y + blockSize2d.y - 1) / blockSize2d.y);
+
+	//performance time tracking
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+
+#if PERFORMANCE_TIME
+	cudaEventRecord(start);
+#endif
+
+	for (int stepWidth = 1; stepWidth * 4 + 1 <= ui_filterSize; stepWidth *= 2)
+	{
+		aTrousFilter << <blocksPerGrid2d, blockSize2d >> > (cam, resolution, stepWidth, ui_colorWeight, ui_normalWeight, ui_positionWeight, dev_image, dev_gBuffer, dev_blurredImg);
+		std::swap(dev_image, dev_blurredImg);
+	}
+#if PERFORMANCE_TIME
+	cudaEventRecord(stop);
+#endif
+	cudaMemcpy(hst_scene->state.image.data(), dev_image, resolution.x * resolution.y * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
+	
+#if PERFORMANCE_TIME
+	cudaEventSynchronize(stop);
+	float milliseconds = 0;
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	std::cout << "denoise took :" << milliseconds << std::endl;
+#endif
 }

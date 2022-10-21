@@ -23,12 +23,12 @@ int startupIterations = 0;
 int lastLoopIterations = 0;
 bool ui_showGbuffer = false;
 bool ui_denoise = false;
-int ui_filterSize = 80;
-float ui_colorWeight = 0.45f;
-float ui_normalWeight = 0.35f;
+int ui_filterSize = 25;
+float ui_colorWeight = 45.f;
+float ui_normalWeight = 0.3f;
 float ui_positionWeight = 0.2f;
 bool ui_saveAndExit = false;
-
+bool hasBeenDenoised = false;
 static bool camchanged = true;
 static float dtheta = 0, dphi = 0;
 static glm::vec3 cammove;
@@ -162,6 +162,21 @@ void runCuda() {
         // execute the kernel
         int frame = 0;
         pathtrace(frame, iteration);
+        if (iteration == ui_iterations && ui_denoise) {
+            denoise();
+            hasBeenDenoised = true;
+        }
+    } 
+
+    if (iteration == ui_iterations && ui_denoise && !hasBeenDenoised) {
+        denoise();
+        hasBeenDenoised = true;
+    }
+
+    if (hasBeenDenoised && !ui_denoise) {
+        lastLoopIterations = 0;
+        camchanged = true;
+        hasBeenDenoised = false;
     }
 
     if (ui_showGbuffer) {

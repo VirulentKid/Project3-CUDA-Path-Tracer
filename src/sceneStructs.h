@@ -6,6 +6,8 @@
 #include "glm/glm.hpp"
 
 #define BACKGROUND_COLOR (glm::vec3(0.0f))
+#define Z_DEPTH 1
+#define OCT_ENCODING_NOR 1
 
 enum GeomType {
 	SPHERE,
@@ -96,5 +98,15 @@ struct ShadeableIntersection {
 };
 
 struct GBufferPixel {
-	float t;
+#if Z_DEPTH
+	float z;
+#else
+	glm::vec3 pos;
+#endif
+
+#if OCT_ENCODING_NOR
+	glm::vec2 octNormal;
+#else
+	glm::vec3 normal;
+#endif
 };
